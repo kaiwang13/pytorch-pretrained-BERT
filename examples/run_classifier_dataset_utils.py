@@ -21,6 +21,7 @@ import csv
 import logging
 import os
 import sys
+import hashlib
 
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import matthews_corrcoef, f1_score
@@ -255,6 +256,13 @@ class StsbProcessor(DataProcessor):
         return examples
 
 
+def get_md5(string):
+    string = str(string)
+    hl = hashlib.md5()
+    hl.update(string.encode('utf-8'))
+    return hl.hexdigest()
+
+
 class QqpProcessor(DataProcessor):
     """Processor for the QQP data set (GLUE version)."""
 
@@ -276,13 +284,11 @@ class QqpProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = "%s-%s" % (set_type, get_md5(line[0] + '\t' + line[1]))
             try:
-                text_a = line[3]
-                text_b = line[4]
-                label = line[5]
+                text_a = line[0]
+                text_b = line[1]
+                label = line[2]
             except IndexError:
                 continue
             examples.append(
