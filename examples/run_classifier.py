@@ -17,6 +17,7 @@
 
 from __future__ import absolute_import, division, print_function
 
+import torch.nn as nn
 import argparse
 import logging
 import os
@@ -29,7 +30,7 @@ import numpy as np
 
 import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-                              TensorDataset)
+                              TensorDataset, WeightedRandomSampler)
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn import CrossEntropyLoss, MSELoss
 
@@ -38,7 +39,7 @@ from pytorch_pretrained_bert.modeling import BertForSequenceClassification
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
 
-from examples.run_classifier_dataset_utils import processors, output_modes, convert_examples_to_features, compute_metrics
+from examples.run_classifier_dataset_utils import *
 
 if sys.version_info[0] == 2:
     import cPickle as pickle
@@ -48,7 +49,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 
 def main():
@@ -206,6 +207,11 @@ def main():
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels=num_labels)
+
+    # model.config.type_vocab_size = 4
+    # model.bert.embeddings.token_type_embeddings = nn.Embedding(model.config.type_vocab_size, model.config.hidden_size)
+    # nn.init.xavier_uniform_(model.bert.embeddings.token_type_embeddings.weight)
+
     if args.local_rank == 0:
         torch.distributed.barrier()
 
@@ -253,7 +259,15 @@ def main():
 
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
         if args.local_rank == -1:
-            train_sampler = RandomSampler(train_data)
+            # train_sampler = RandomSampler(train_data)
+            weights = []
+            for id in all_label_ids:
+                if id == 1:
+                    weights.append(1.0 / 14335)
+                else:
+                    weights.append(1.0 / 715)
+            weights = torch.tensor(weights)
+            train_sampler = WeightedRandomSampler(weights, len(weights))
         else:
             train_sampler = DistributedSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
@@ -301,43 +315,45 @@ def main():
             model.train()
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
-            for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])):
-                batch = tuple(t.to(device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids = batch
+            with tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0]) as t:
+                for step, batch in enumerate(t):
+                    batch = tuple(t.to(device) for t in batch)
+                    input_ids, input_mask, segment_ids, label_ids = batch
 
-                # define a new function to compute loss values for both output_modes
-                logits = model(input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
+                    # define a new function to compute loss values for both output_modes
+                    logits = model(input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
 
-                if output_mode == "classification":
-                    loss_fct = CrossEntropyLoss()
-                    loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
-                elif output_mode == "regression":
-                    loss_fct = MSELoss()
-                    loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                    if output_mode == "classification":
+                        loss_fct = CrossEntropyLoss()
+                        loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
+                    elif output_mode == "regression":
+                        loss_fct = MSELoss()
+                        loss = loss_fct(logits.view(-1), label_ids.view(-1))
 
-                if n_gpu > 1:
-                    loss = loss.mean() # mean() to average on multi-gpu.
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
-
-                if args.fp16:
-                    optimizer.backward(loss)
-                else:
-                    loss.backward()
-
-                tr_loss += loss.item()
-                nb_tr_examples += input_ids.size(0)
-                nb_tr_steps += 1
-                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    if n_gpu > 1:
+                        loss = loss.mean() # mean() to average on multi-gpu.
+                    if args.gradient_accumulation_steps > 1:
+                        loss = loss / args.gradient_accumulation_steps
+                    t.set_postfix(Loss=loss.item())
+                    t.update()
                     if args.fp16:
-                        # modify learning rate with special warm up BERT uses
-                        # if args.fp16 is False, BertAdam is used that handles this automatically
-                        lr_this_step = args.learning_rate * warmup_linear.get_lr(global_step, args.warmup_proportion)
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr_this_step
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    global_step += 1
+                        optimizer.backward(loss)
+                    else:
+                        loss.backward()
+
+                    tr_loss += loss.item()
+                    nb_tr_examples += input_ids.size(0)
+                    nb_tr_steps += 1
+                    if (step + 1) % args.gradient_accumulation_steps == 0:
+                        if args.fp16:
+                            # modify learning rate with special warm up BERT uses
+                            # if args.fp16 is False, BertAdam is used that handles this automatically
+                            lr_this_step = args.learning_rate * warmup_linear.get_lr(global_step, args.warmup_proportion)
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = lr_this_step
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        global_step += 1
             epoch_output_dir = os.path.join(args.output_dir, 'epoch' + str(epoch))
             ### Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
             ### Example:

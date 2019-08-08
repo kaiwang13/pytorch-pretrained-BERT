@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 from examples.Utils import *
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 
 def padding(list, max_len):
@@ -64,21 +64,21 @@ def preprocess(query_tokens, doc_tokens, tokenizer, max_len):
 
 if __name__ == '__main__':
     device = torch.device('cuda:0')
-    after_result = json_load('../samples/QLP/after_label.json')
-    sample_ids = set()
-    for k, _ in after_result.items():
-        sample_ids.add(int(k))
+    sep = ' [SEP] '
     samples = []
-    with open('../samples/QLP/ValidationData_after.tsv', 'r', encoding='utf8') as f:
+    i = 0
+    input = {}
+    with open('../samples/QLP/OutputDataOfGoodDebug.tsv', 'r', encoding='utf8') as f:
         for line in f:
             line = line.strip()
-            index, title, _, _, url, doc = line.split('\t')
-            index = int(index)
-            if index in sample_ids:
-                samples.append([index, title, url, doc])
+            label, title1, title2, description, doc = line.split('\t')
+            url = doc.split()[0]
+            samples.append([i, title1 + sep + title2 + sep + description, url, doc])
+            input[i] = [int(label), -1, title1 + sep + title2 + sep + description, url, doc]
+            i += 1
     # json_dump(samples, '../samples/QLP/ValidationData_after.json')
     # samples = json_load('../samples/QLP/ValidationData_after.json')
-    epoch_output_dir = '/home/work/waka/projects/pytorch-pretrained-BERT/samples/QLP/result/base/title2/epoch2/'
+    epoch_output_dir = '/home/work/waka/projects/pytorch-pretrained-BERT/samples/QLP/result/base/fullAd/Random/2parts/epoch2'
     model = BertForSequenceClassification.from_pretrained(epoch_output_dir, num_labels=2).to(device)
     tokenizer = BertTokenizer.from_pretrained(epoch_output_dir, do_lower_case=True)
 
@@ -127,25 +127,16 @@ if __name__ == '__main__':
             segment_ids = segment_ids.to(device)
             with torch.no_grad():
                 logits = model(input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
-            scores = F.softmax(logits, dim=-1)[:, 1:].squeeze().cpu().numpy()
+            predicted_label = torch.argmax(logits, dim=-1).cpu().numpy()
             for i in range(len(index)):
-                if index[i] not in result:
-                    result[index[i]] = []
-                result[index[i]].append([title[i], url[i], doc[i], scores[i].item()])
+                result[index[i]] = predicted_label[i].item()
             t.update()
-    top1_result = {}
-    for k, v in result.items():
-        top1_title = ''
-        top1_url = ''
-        top1_score = -1.0
-        for sample in v:
-            if sample[3] > top1_score:
-                top1_title = sample[0]
-                top1_url = sample[1]
-                top1_score = sample[3]
-        top1_result[k] = {
-            'Title': top1_title,
-            'Url': top1_url
-        }
-    json_dump(top1_result, '../samples/QLP/self_bert_title2_epoch2_top1.json')
-    json_dump(result, '../samples/QLP/self_bert_title2_epoch2.json')
+    total = 0
+    correct = 0
+    for k in input.keys():
+        input[k][1] = result[k]
+        total += 1
+        if input[k][0] == result[k]:
+            correct += 1
+    print(100.0 * correct / total)
+    json_dump(input, '../samples/QLP/self_bert_fullAd_2parts_epoch2_label_data.json')

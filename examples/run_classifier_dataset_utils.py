@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
 
-    def __init__(self, guid, text_a, text_b=None, label=None):
+    def __init__(self, guid, text_a, text_b=None, text_c=None, text_d=None, label=None):
         """Constructs a InputExample.
 
         Args:
@@ -47,6 +47,8 @@ class InputExample(object):
         self.guid = guid
         self.text_a = text_a
         self.text_b = text_b
+        self.text_c = text_c
+        self.text_d = text_d
         self.label = label
 
 
@@ -284,15 +286,19 @@ class QqpProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, get_md5(line[0] + '\t' + line[1]))
+            guid = "%s-%s" % (set_type, get_md5('\t'.join(line)))
             try:
                 text_a = line[0]
                 text_b = line[1]
-                label = line[2]
+                # text_c = line[2]
+                # text_d = line[3]
+                text_c = None
+                text_d = None
+                label = line[-1]
             except IndexError:
                 continue
             examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+                InputExample(guid=guid, text_a=text_a, text_b=text_b, text_c=text_c, text_d=text_d, label=label))
         return examples
 
 
@@ -391,6 +397,90 @@ class WnliProcessor(DataProcessor):
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
+
+
+def convert_examples_to_features_4parts(examples, label_list, max_seq_length, tokenizer, output_mode):
+    """Loads a data file into a list of `InputBatch`s."""
+
+    label_map = {label : i for i, label in enumerate(label_list)}
+
+    features = []
+    for (ex_index, example) in enumerate(examples):
+        if ex_index % 10000 == 0:
+            logger.info("Writing example %d of %d" % (ex_index, len(examples)))
+
+        tokens_a = tokenizer.tokenize(example.text_a)
+        tokens_b = tokenizer.tokenize(example.text_b)
+        tokens_c = tokenizer.tokenize(example.text_c)
+        tokens_d = tokenizer.tokenize(example.text_d)
+
+        # The convention in BERT is:
+        # (a) For sequence pairs:
+        #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
+        #  type_ids: 0   0  0    0    0     0       0 0    1  1  1  1   1 1
+        # (b) For single sequences:
+        #  tokens:   [CLS] the dog is hairy . [SEP]
+        #  type_ids: 0   0   0   0  0     0 0
+        #
+        # Where "type_ids" are used to indicate whether this is the first
+        # sequence or the second sequence. The embedding vectors for `type=0` and
+        # `type=1` were learned during pre-training and are added to the wordpiece
+        # embedding vector (and position vector). This is not *strictly* necessary
+        # since the [SEP] token unambiguously separates the sequences, but it makes
+        # it easier for the model to learn the concept of sequences.
+        #
+        # For classification tasks, the first vector (corresponding to [CLS]) is
+        # used as as the "sentence vector". Note that this only makes sense because
+        # the entire model is fine-tuned.
+        tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"] + tokens_c + ["[SEP]"] + tokens_d + ["[SEP]"]
+        segment_ids = ([0] * (len(tokens_a) + 2)) + \
+                      ([1] * (len(tokens_b) + 1)) + \
+                      ([2] * (len(tokens_c) + 1)) + \
+                      ([3] * (len(tokens_d) + 1))
+        if len(tokens) > max_seq_length:
+            tokens = tokens[:max_seq_length - 1] + ["[SEP]"]
+            segment_ids = segment_ids[:max_seq_length]
+
+        input_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+        # The mask has 1 for real tokens and 0 for padding tokens. Only real
+        # tokens are attended to.
+        input_mask = [1] * len(input_ids)
+
+        # Zero-pad up to the sequence length.
+        padding = [0] * (max_seq_length - len(input_ids))
+        input_ids += padding
+        input_mask += padding
+        segment_ids += padding
+
+        assert len(input_ids) == max_seq_length
+        assert len(input_mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+
+        if output_mode == "classification":
+            label_id = label_map[example.label]
+        elif output_mode == "regression":
+            label_id = float(example.label)
+        else:
+            raise KeyError(output_mode)
+
+        if ex_index < 5:
+            logger.info("*** Example ***")
+            logger.info("guid: %s" % (example.guid))
+            logger.info("tokens: %s" % " ".join(
+                    [str(x) for x in tokens]))
+            logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+            logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+            logger.info(
+                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+            logger.info("label: %s (id = %d)" % (example.label, label_id))
+
+        features.append(
+                InputFeatures(input_ids=input_ids,
+                              input_mask=input_mask,
+                              segment_ids=segment_ids,
+                              label_id=label_id))
+    return features
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length,

@@ -29,9 +29,11 @@
 """
 import argparse
 import os
-import csv
+import multiprocessing
 import random
 import logging
+from functools import reduce
+import pathlib
 from tqdm import tqdm, trange
 
 import numpy as np
@@ -40,30 +42,35 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 
 from pytorch_pretrained_bert import (OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
-                                     OpenAIAdam, cached_path, WEIGHTS_NAME, CONFIG_NAME)
+                                     OpenAIAdam, cached_path, WEIGHTS_NAME, CONFIG_NAME, OpenAIGPTLMHeadModel)
+from examples.Utils import *
 
-ROCSTORIES_URL = "https://s3.amazonaws.com/datasets.huggingface.co/ROCStories.tar.gz"
-
-logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                    datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def accuracy(out, labels):
+
+def accuracy(out):
     outputs = np.argmax(out, axis=1)
-    return np.sum(outputs == labels)
+    return np.sum(outputs == 0)
 
-def load_rocstories_dataset(dataset_path):
-    """ Output a list of tuples(story, 1st continuation, 2nd continuation, label) """
-    with open(dataset_path, encoding='utf_8') as f:
-        f = csv.reader(f)
-        output = []
-        next(f) # skip the first line
-        for line in tqdm(f):
-            output.append((' '.join(line[1:5]), line[5], line[6], int(line[-1])-1))
-    return output
 
-def pre_process_datasets(encoded_datasets, input_len, cap_length, start_token, delimiter_token, clf_token):
+model_name = ''
+
+
+def tokenize_and_encode(dataset):
+    special_tokens = ['<BOA>', '<SEP>', '<EOA>']
+    tokenizer = OpenAIGPTTokenizer.from_pretrained(model_name, special_tokens=special_tokens)
+    for i in range(len(dataset)):
+        dataset[i] = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][0])),
+                      tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][1])),
+                      tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][2]))]
+
+    return dataset
+
+
+def pre_process_datasets(encoded_datasets, input_len, start_token, sep_token, end_token):
     """ Pre-process datasets containing lists of tuples(story, 1st continuation, 2nd continuation, label)
 
         To Transformer inputs of shape (n_batch, n_alternative, length) comprising for each batch, continuation:
@@ -72,25 +79,21 @@ def pre_process_datasets(encoded_datasets, input_len, cap_length, start_token, d
     tensor_datasets = []
     for dataset in encoded_datasets:
         n_batch = len(dataset)
-        input_ids = np.zeros((n_batch, 2, input_len), dtype=np.int64)
-        mc_token_ids = np.zeros((n_batch, 2), dtype=np.int64)
-        lm_labels = np.full((n_batch, 2, input_len), fill_value=-1, dtype=np.int64)
-        mc_labels = np.zeros((n_batch,), dtype=np.int64)
-        for i, (story, cont1, cont2, mc_label), in enumerate(dataset):
-            with_cont1 = [start_token] + story[:cap_length] + [delimiter_token] + cont1[:cap_length] + [clf_token]
-            with_cont2 = [start_token] + story[:cap_length] + [delimiter_token] + cont2[:cap_length] + [clf_token]
-            input_ids[i, 0, :len(with_cont1)] = with_cont1
-            input_ids[i, 1, :len(with_cont2)] = with_cont2
-            mc_token_ids[i, 0] = len(with_cont1) - 1
-            mc_token_ids[i, 1] = len(with_cont2) - 1
-            lm_labels[i, 0, :len(with_cont1)] = with_cont1
-            lm_labels[i, 1, :len(with_cont2)] = with_cont2
-            mc_labels[i] = mc_label
-        all_inputs = (input_ids, mc_token_ids, lm_labels, mc_labels)
+        input_ids = np.zeros((n_batch, input_len), dtype=np.int64)
+        input_lengths = np.zeros((n_batch,), dtype=np.int64)
+        lm_labels = np.full((n_batch, input_len), fill_value=-1, dtype=np.int64)
+        for i, (title1, title2, description), in enumerate(dataset):
+            ad = [start_token] + title1 + [sep_token] + title2 + [sep_token] + description + [end_token]
+            if len(ad) <= 64:
+                input_ids[i, :len(ad)] = ad
+                input_lengths[i] = len(ad)
+                lm_labels[i, :len(ad)] = ad
+        all_inputs = (input_ids, input_lengths, lm_labels)
         tensor_datasets.append(tuple(torch.tensor(t) for t in all_inputs))
     return tensor_datasets
 
-def main():
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='openai-gpt',
                         help='pretrained model name')
@@ -103,13 +106,12 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_train_epochs', type=int, default=3)
     parser.add_argument('--train_batch_size', type=int, default=8)
-    parser.add_argument('--eval_batch_size', type=int, default=16)
+    parser.add_argument('--eval_batch_size', type=int, default=128)
     parser.add_argument('--max_grad_norm', type=int, default=1)
     parser.add_argument('--learning_rate', type=float, default=6.25e-5)
     parser.add_argument('--warmup_proportion', type=float, default=0.002)
     parser.add_argument('--lr_schedule', type=str, default='warmup_linear')
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--lm_coef', type=float, default=0.9)
     parser.add_argument('--n_valid', type=int, default=374)
 
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
@@ -127,10 +129,11 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_gpu = torch.cuda.device_count()
+    if n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
     logger.info("device: {}, n_gpu {}".format(device, n_gpu))
 
     if not args.do_train and not args.do_eval:
@@ -142,36 +145,40 @@ def main():
     # Load tokenizer and model
     # This loading functions also add new tokens and embeddings called `special tokens`
     # These new embeddings will be fine-tuned on the RocStories dataset
-    special_tokens = ['_start_', '_delimiter_', '_classify_']
+    special_tokens = ['<BOA>', '<SEP>', '<EOA>']
+    model_name = args.model_name
     tokenizer = OpenAIGPTTokenizer.from_pretrained(args.model_name, special_tokens=special_tokens)
     special_tokens_ids = list(tokenizer.convert_tokens_to_ids(token) for token in special_tokens)
-    model = OpenAIGPTDoubleHeadsModel.from_pretrained(args.model_name, num_special_tokens=len(special_tokens))
+    model = OpenAIGPTLMHeadModel.from_pretrained(args.model_name, num_special_tokens=len(special_tokens))
     model.to(device)
+    original_model = model
+    if n_gpu > 1:
+        model = torch.nn.DataParallel(model)
 
-    # Load and encode the datasets
-    if not args.train_dataset and not args.eval_dataset:
-        roc_stories = cached_path(ROCSTORIES_URL)
-    def tokenize_and_encode(obj):
-        """ Tokenize and encode a nested object """
-        if isinstance(obj, str):
-            return tokenizer.convert_tokens_to_ids(tokenizer.tokenize(obj))
-        elif isinstance(obj, int):
-            return obj
-        return list(tokenize_and_encode(o) for o in obj)
     logger.info("Encoding dataset...")
-    train_dataset = load_rocstories_dataset(args.train_dataset)
-    eval_dataset = load_rocstories_dataset(args.eval_dataset)
-    datasets = (train_dataset, eval_dataset)
-    encoded_datasets = tokenize_and_encode(datasets)
+    train_dataset = json_load(args.train_dataset)
+    eval_dataset = json_load(args.eval_dataset)
+
+    tasks = chunk(train_dataset, 20)
+    with multiprocessing.Pool(processes=20) as pool:
+        sub_results = pool.map(tokenize_and_encode, tasks)
+    train_dataset = reduce(lambda x, y: x + y, sub_results)
+
+    tasks = chunk(eval_dataset, 20)
+    with multiprocessing.Pool(processes=20) as pool:
+        sub_results = pool.map(tokenize_and_encode, tasks)
+    eval_dataset = reduce(lambda x, y: x + y, sub_results)
+
+    encoded_datasets = (train_dataset, eval_dataset)
 
     # Compute the max input length for the Transformer
-    max_length = model.config.n_positions // 2 - 2
-    input_length = max(len(story[:max_length]) + max(len(cont1[:max_length]), len(cont2[:max_length])) + 3  \
-                           for dataset in encoded_datasets for story, cont1, cont2, _ in dataset)
-    input_length = min(input_length, model.config.n_positions)  # Max size of input for the pre-trained model
+    max_length = original_model.config.n_positions // 2 - 2
+    input_length = max(len(title1) + len(title2) + len(description) + 4 \
+                       for dataset in encoded_datasets for title1, title2, description in dataset)
+    input_length = min(input_length, 64)  # Max size of input for the pre-trained model
 
     # Prepare inputs tensors and dataloaders
-    tensor_datasets = pre_process_datasets(encoded_datasets, input_length, max_length, *special_tokens_ids)
+    tensor_datasets = pre_process_datasets(encoded_datasets, input_length, *special_tokens_ids)
     train_tensor_dataset, eval_tensor_dataset = tensor_datasets[0], tensor_datasets[1]
 
     train_data = TensorDataset(*train_tensor_dataset)
@@ -182,6 +189,8 @@ def main():
     eval_sampler = SequentialSampler(eval_data)
     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
+
+
     # Prepare optimizer
     if args.do_train:
         param_optimizer = list(model.named_parameters())
@@ -189,7 +198,7 @@ def main():
         optimizer_grouped_parameters = [
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-            ]
+        ]
         num_train_optimization_steps = len(train_dataloader) * args.num_train_epochs
         optimizer = OpenAIAdam(optimizer_grouped_parameters,
                                lr=args.learning_rate,
@@ -201,75 +210,69 @@ def main():
     if args.do_train:
         nb_tr_steps, tr_loss, exp_average_loss = 0, 0, None
         model.train()
-        for _ in trange(int(args.num_train_epochs), desc="Epoch"):
+        for epoch in trange(int(args.num_train_epochs), desc="Epoch"):
             tr_loss = 0
             nb_tr_steps = 0
             tqdm_bar = tqdm(train_dataloader, desc="Training")
             for step, batch in enumerate(tqdm_bar):
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, mc_token_ids, lm_labels, mc_labels = batch
-                losses = model(input_ids, mc_token_ids, lm_labels, mc_labels)
-                loss = args.lm_coef * losses[0] + losses[1]
+                input_ids, input_lengths, lm_labels = batch
+                loss = model(input_ids=input_ids, lm_labels=lm_labels)
+                if n_gpu > 1:
+                    loss = loss.mean()
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 tr_loss += loss.item()
-                exp_average_loss = loss.item() if exp_average_loss is None else 0.7*exp_average_loss+0.3*loss.item()
+                exp_average_loss = loss.item() if exp_average_loss is None else 0.7 * exp_average_loss + 0.3 * loss.item()
                 nb_tr_steps += 1
                 tqdm_bar.desc = "Training loss: {:.2e} lr: {:.2e}".format(exp_average_loss, optimizer.get_lr()[0])
 
-        # Save a trained model
-        if args.do_train:
-            # Save a trained model, configuration and tokenizer
-            model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+            # Save a trained model
+            if args.do_train:
+                pathlib.Path(os.path.join(args.output_dir, 'epoch' + str(epoch))).mkdir(parents=True, exist_ok=True)
+                # Save a trained model, configuration and tokenizer
+                model_to_save = original_model.module if hasattr(original_model, 'module') else original_model  # Only save the model it-self
 
-            # If we save using the predefined names, we can load using `from_pretrained`
-            output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-            output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+                # If we save using the predefined names, we can load using `from_pretrained`
+                output_model_file = os.path.join(args.output_dir, 'epoch' + str(epoch), WEIGHTS_NAME)
+                output_config_file = os.path.join(args.output_dir, 'epoch' + str(epoch), CONFIG_NAME)
 
-            torch.save(model_to_save.state_dict(), output_model_file)
-            model_to_save.config.to_json_file(output_config_file)
-            tokenizer.save_vocabulary(args.output_dir)
+                torch.save(model_to_save.state_dict(), output_model_file)
+                model_to_save.config.to_json_file(output_config_file)
+                tokenizer.save_vocabulary(os.path.join(args.output_dir, 'epoch' + str(epoch)))
 
-            # Load a trained model and vocabulary that you have fine-tuned
-            model = OpenAIGPTDoubleHeadsModel.from_pretrained(args.output_dir)
-            tokenizer = OpenAIGPTTokenizer.from_pretrained(args.output_dir)
-            model.to(device)
+                # # Load a trained model and vocabulary that you have fine-tuned
+                # model = OpenAIGPTLMHeadModel.from_pretrained(args.output_dir)
+                # tokenizer = OpenAIGPTTokenizer.from_pretrained(args.output_dir)
+                # model.to(device)
 
-        if args.do_eval:
-            model.eval()
-            eval_loss, eval_accuracy = 0, 0
-            nb_eval_steps, nb_eval_examples = 0, 0
-            for batch in tqdm(eval_dataloader, desc="Evaluating"):
-                batch = tuple(t.to(device) for t in batch)
-                input_ids, mc_token_ids, lm_labels, mc_labels = batch
-                with torch.no_grad():
-                    _, mc_loss = model(input_ids, mc_token_ids, lm_labels, mc_labels)
-                    _, mc_logits = model(input_ids, mc_token_ids)
+            if args.do_eval:
+                original_model.eval()
+                eval_loss, eval_accuracy = 0, 0
+                nb_eval_steps, nb_eval_examples = 0, 0
+                for batch in tqdm(eval_dataloader, desc="Evaluating"):
+                    batch = tuple(t.to(device) for t in batch)
+                    input_ids, input_lengths, lm_labels = batch
+                    with torch.no_grad():
+                        probabilities = original_model.forward_log_probability(input_ids, input_lengths)
+                    probabilities = probabilities.reshape(-1, 4).numpy()
+                    tmp_eval_accuracy = accuracy(probabilities)
 
-                mc_logits = mc_logits.detach().cpu().numpy()
-                mc_labels = mc_labels.to('cpu').numpy()
-                tmp_eval_accuracy = accuracy(mc_logits, mc_labels)
+                    eval_accuracy += tmp_eval_accuracy
 
-                eval_loss += mc_loss.mean().item()
-                eval_accuracy += tmp_eval_accuracy
+                    nb_eval_examples += input_ids.size(0)
+                    nb_eval_steps += 1
 
-                nb_eval_examples += input_ids.size(0)
-                nb_eval_steps += 1
+                eval_loss = eval_loss / nb_eval_steps
+                eval_accuracy = eval_accuracy / nb_eval_examples
+                train_loss = tr_loss / nb_tr_steps if args.do_train else None
+                result = {'eval_accuracy': eval_accuracy,
+                          'train_loss': train_loss}
 
-            eval_loss = eval_loss / nb_eval_steps
-            eval_accuracy = eval_accuracy / nb_eval_examples
-            train_loss = tr_loss/nb_tr_steps if args.do_train else None
-            result = {'eval_loss': eval_loss,
-                      'eval_accuracy': eval_accuracy,
-                      'train_loss': train_loss}
-
-            output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
-            with open(output_eval_file, "w") as writer:
-                logger.info("***** Eval results *****")
-                for key in sorted(result.keys()):
-                    logger.info("  %s = %s", key, str(result[key]))
-                    writer.write("%s = %s\n" % (key, str(result[key])))
-
-if __name__ == '__main__':
-    main()
+                output_eval_file = os.path.join(args.output_dir, 'epoch' + str(epoch), "eval_results.txt")
+                with open(output_eval_file, "w") as writer:
+                    logger.info("***** Eval results *****")
+                    for key in sorted(result.keys()):
+                        logger.info("  %s = %s", key, str(result[key]))
+                        writer.write("%s = %s\n" % (key, str(result[key])))

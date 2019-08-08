@@ -7,6 +7,7 @@ def add_negative_samples(samples):
     all_title_set = set()
     for sample in samples:
         all_title_set.add(sample[0])
+    all_title_set = list(all_title_set)
     result = []
     for sample in samples:
         result.append(sample)
@@ -18,7 +19,7 @@ def add_negative_samples(samples):
 
 if __name__ == '__main__':
     all_samples = []
-    with open('../samples/QLP/UrlMSAdtitle1TrainingData_1000.tsv', 'r', encoding='utf8') as f:
+    with open('../samples/QLP/UrlMSAdtitleTrainingData_1000.tsv', 'r', encoding='utf8') as f:
         for line in f:
             title, lp = line.split('\t')
             title = title.strip()
@@ -28,7 +29,7 @@ if __name__ == '__main__':
     random.shuffle(all_samples)
 
     train_ratio = 0.8
-    train_data = all_samples[:100000]
+    train_data = all_samples[:int(len(all_samples) * train_ratio)]
     print(len(train_data))
 
     tasks = chunk(train_data, 20)
@@ -39,7 +40,7 @@ if __name__ == '__main__':
     for sub_result in sub_results:
         train_data += sub_result
     random.shuffle(train_data)
-    with open('../samples/QLP/data/train.tsv', 'w', encoding='utf8') as f:
+    with open('../samples/QLP/data/title/full/train.tsv', 'w', encoding='utf8') as f:
         for sample in train_data:
             f.write(sample[0] + '\t' + sample[1] + '\t' + str(sample[2]) + '\n')
 
@@ -53,7 +54,7 @@ if __name__ == '__main__':
     for sub_result in sub_results:
         test_data += sub_result
     random.shuffle(test_data)
-    with open('../samples/QLP/data/test.tsv', 'w', encoding='utf8') as f:
+    with open('../samples/QLP/data/title/full/test.tsv', 'w', encoding='utf8') as f:
         for sample in test_data:
             f.write(sample[0] + '\t' + sample[1] + '\t' + str(sample[2]) + '\n')
 
@@ -67,6 +68,6 @@ if __name__ == '__main__':
     for sub_result in sub_results:
         dev_data += sub_result
     random.shuffle(dev_data)
-    with open('../samples/QLP/data/dev.tsv', 'w', encoding='utf8') as f:
+    with open('../samples/QLP/data/title/full/dev.tsv', 'w', encoding='utf8') as f:
         for sample in dev_data:
             f.write(sample[0] + '\t' + sample[1] + '\t' + str(sample[2]) + '\n')
