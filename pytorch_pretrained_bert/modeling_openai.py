@@ -869,6 +869,22 @@ class OpenAIGPTLMHeadModel(OpenAIGPTPreTrainedModel):
                 result[i] += log_probability[i][j][next_ids[i][j]]
         return result
 
+    def forward_ppl(self, input_ids, input_lengths, position_ids=None, token_type_ids=None, head_mask=None):
+        hidden_states = self.transformer(input_ids, position_ids, token_type_ids, head_mask)
+        if self.transformer.output_attentions:
+            all_attentions, hidden_states = hidden_states
+        hidden_states = hidden_states[-1]
+
+        lm_logits = self.lm_head(hidden_states)
+        log_probability = torch.log_softmax(lm_logits, dim=-1)
+        next_ids = input_ids[..., 1:]
+        result = torch.zeros((input_ids.size()[0],))
+        for i in range(input_ids.size()[0]):
+            for j in range(input_lengths[i] - 1):
+                result[i] -= log_probability[i][j][next_ids[i][j]]
+            result[i] /= input_lengths[i] - 1
+        return result
+
 
 class OpenAIGPTDoubleHeadsModel(OpenAIGPTPreTrainedModel):
     """OpenAI GPT model with a Language Modeling and a Multiple Choice head ("Improving Language Understanding by Generative Pre-Training").

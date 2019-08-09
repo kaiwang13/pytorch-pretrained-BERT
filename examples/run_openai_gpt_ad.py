@@ -70,6 +70,40 @@ def tokenize_and_encode(dataset):
     return dataset
 
 
+def tokenize_and_encode_single_part(dataset):
+    special_tokens = ['<BOA>', '<EOA>']
+    tokenizer = OpenAIGPTTokenizer.from_pretrained(model_name, special_tokens=special_tokens)
+    for i in range(len(dataset)):
+        dataset[i] = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][0])),
+                      tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][1])),
+                      tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][2]))]
+
+    return dataset
+
+
+def pre_process_datasets_single_part(encoded_datasets, input_len, start_token, end_token):
+    """ Pre-process datasets containing lists of tuples(story, 1st continuation, 2nd continuation, label)
+
+        To Transformer inputs of shape (n_batch, n_alternative, length) comprising for each batch, continuation:
+        input_ids[batch, alternative, :] = [start_token] + story[:cap_length] + [delimiter_token] + cont1[:cap_length] + [clf_token]
+    """
+    tensor_datasets = []
+    for dataset in encoded_datasets:
+        n_batch = len(dataset)
+        input_ids = np.zeros((n_batch, input_len), dtype=np.int64)
+        input_lengths = np.zeros((n_batch,), dtype=np.int64)
+        lm_labels = np.full((n_batch, input_len), fill_value=-1, dtype=np.int64)
+        for i, text, in enumerate(dataset):
+            ad = [start_token] + text + [end_token]
+            if len(ad) <= input_len:
+                input_ids[i, :len(ad)] = ad
+                input_lengths[i] = len(ad)
+                lm_labels[i, :len(ad)] = ad
+        all_inputs = (input_ids, input_lengths, lm_labels)
+        tensor_datasets.append(tuple(torch.tensor(t) for t in all_inputs))
+    return tensor_datasets
+
+
 def pre_process_datasets(encoded_datasets, input_len, start_token, sep_token, end_token):
     """ Pre-process datasets containing lists of tuples(story, 1st continuation, 2nd continuation, label)
 
@@ -84,7 +118,7 @@ def pre_process_datasets(encoded_datasets, input_len, start_token, sep_token, en
         lm_labels = np.full((n_batch, input_len), fill_value=-1, dtype=np.int64)
         for i, (title1, title2, description), in enumerate(dataset):
             ad = [start_token] + title1 + [sep_token] + title2 + [sep_token] + description + [end_token]
-            if len(ad) <= 64:
+            if len(ad) <= input_len:
                 input_ids[i, :len(ad)] = ad
                 input_lengths[i] = len(ad)
                 lm_labels[i, :len(ad)] = ad
@@ -97,6 +131,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='openai-gpt',
                         help='pretrained model name')
+    parser.add_argument('--ft_name', type=str)
     parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true', help="Whether to run eval on the dev set.")
     parser.add_argument("--output_dir", default=None, type=str, required=True,
@@ -113,7 +148,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr_schedule', type=str, default='warmup_linear')
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--n_valid', type=int, default=374)
-
+    parser.add_argument("--single_part", action='store_true')
+    parser.add_argument('--max_seq_length', type=int, default=64)
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
     args = parser.parse_args()
@@ -145,7 +181,11 @@ if __name__ == '__main__':
     # Load tokenizer and model
     # This loading functions also add new tokens and embeddings called `special tokens`
     # These new embeddings will be fine-tuned on the RocStories dataset
-    special_tokens = ['<BOA>', '<SEP>', '<EOA>']
+    if args.single_part:
+        special_tokens = ['<BOA>', '<EOA>']
+    else:
+        special_tokens = ['<BOA>', '<SEP>', '<EOA>']
+
     model_name = args.model_name
     tokenizer = OpenAIGPTTokenizer.from_pretrained(args.model_name, special_tokens=special_tokens)
     special_tokens_ids = list(tokenizer.convert_tokens_to_ids(token) for token in special_tokens)
@@ -161,24 +201,30 @@ if __name__ == '__main__':
 
     tasks = chunk(train_dataset, 20)
     with multiprocessing.Pool(processes=20) as pool:
-        sub_results = pool.map(tokenize_and_encode, tasks)
+        if args.single_part:
+            sub_results = pool.map(tokenize_and_encode_single_part, tasks)
+        else:
+            sub_results = pool.map(tokenize_and_encode, tasks)
     train_dataset = reduce(lambda x, y: x + y, sub_results)
 
     tasks = chunk(eval_dataset, 20)
     with multiprocessing.Pool(processes=20) as pool:
-        sub_results = pool.map(tokenize_and_encode, tasks)
+        if args.single_part:
+            sub_results = pool.map(tokenize_and_encode_single_part, tasks)
+        else:
+            sub_results = pool.map(tokenize_and_encode, tasks)
     eval_dataset = reduce(lambda x, y: x + y, sub_results)
 
     encoded_datasets = (train_dataset, eval_dataset)
 
     # Compute the max input length for the Transformer
-    max_length = original_model.config.n_positions // 2 - 2
-    input_length = max(len(title1) + len(title2) + len(description) + 4 \
-                       for dataset in encoded_datasets for title1, title2, description in dataset)
-    input_length = min(input_length, 64)  # Max size of input for the pre-trained model
+    input_length = args.max_seq_length
 
     # Prepare inputs tensors and dataloaders
-    tensor_datasets = pre_process_datasets(encoded_datasets, input_length, *special_tokens_ids)
+    if args.single_part:
+        tensor_datasets = pre_process_datasets_single_part(encoded_datasets, input_length, *special_tokens_ids)
+    else:
+        tensor_datasets = pre_process_datasets(encoded_datasets, input_length, *special_tokens_ids)
     train_tensor_dataset, eval_tensor_dataset = tensor_datasets[0], tensor_datasets[1]
 
     train_data = TensorDataset(*train_tensor_dataset)
@@ -230,17 +276,18 @@ if __name__ == '__main__':
 
             # Save a trained model
             if args.do_train:
-                pathlib.Path(os.path.join(args.output_dir, 'epoch' + str(epoch))).mkdir(parents=True, exist_ok=True)
+                epoch_root = os.path.join(args.output_dir, args.ft_name, 'epoch' + str(epoch))
+                pathlib.Path(epoch_root).mkdir(parents=True, exist_ok=True)
                 # Save a trained model, configuration and tokenizer
                 model_to_save = original_model.module if hasattr(original_model, 'module') else original_model  # Only save the model it-self
 
                 # If we save using the predefined names, we can load using `from_pretrained`
-                output_model_file = os.path.join(args.output_dir, 'epoch' + str(epoch), WEIGHTS_NAME)
-                output_config_file = os.path.join(args.output_dir, 'epoch' + str(epoch), CONFIG_NAME)
+                output_model_file = os.path.join(epoch_root, WEIGHTS_NAME)
+                output_config_file = os.path.join(epoch_root, CONFIG_NAME)
 
                 torch.save(model_to_save.state_dict(), output_model_file)
                 model_to_save.config.to_json_file(output_config_file)
-                tokenizer.save_vocabulary(os.path.join(args.output_dir, 'epoch' + str(epoch)))
+                tokenizer.save_vocabulary(epoch_root)
 
                 # # Load a trained model and vocabulary that you have fine-tuned
                 # model = OpenAIGPTLMHeadModel.from_pretrained(args.output_dir)
@@ -249,28 +296,37 @@ if __name__ == '__main__':
 
             if args.do_eval:
                 original_model.eval()
-                eval_loss, eval_accuracy = 0, 0
+                eval_loss, eval_accuracy, eval_ppl = 0, 0, 0
                 nb_eval_steps, nb_eval_examples = 0, 0
                 for batch in tqdm(eval_dataloader, desc="Evaluating"):
                     batch = tuple(t.to(device) for t in batch)
                     input_ids, input_lengths, lm_labels = batch
                     with torch.no_grad():
-                        probabilities = original_model.forward_log_probability(input_ids, input_lengths)
-                    probabilities = probabilities.reshape(-1, 4).numpy()
-                    tmp_eval_accuracy = accuracy(probabilities)
-
-                    eval_accuracy += tmp_eval_accuracy
+                        ppls = original_model.forward_ppl(input_ids, input_lengths)
+                    if not args.single_part:
+                        ppls = ppls.reshape(-1, 4).numpy()
+                        tmp_eval_accuracy = accuracy(ppls)
+                        eval_accuracy += tmp_eval_accuracy
+                    else:
+                        eval_ppl += ppls.sum()
 
                     nb_eval_examples += input_ids.size(0)
                     nb_eval_steps += 1
 
-                eval_loss = eval_loss / nb_eval_steps
-                eval_accuracy = eval_accuracy / nb_eval_examples
-                train_loss = tr_loss / nb_tr_steps if args.do_train else None
-                result = {'eval_accuracy': eval_accuracy,
-                          'train_loss': train_loss}
+                eval_loss = 1.0 * eval_loss / nb_eval_steps
+                eval_ppl = 1.0 * eval_ppl / nb_eval_examples
+                eval_accuracy = 1.0 * eval_accuracy / nb_eval_examples
+                train_loss = 1.0 * tr_loss / nb_tr_steps if args.do_train else None
 
-                output_eval_file = os.path.join(args.output_dir, 'epoch' + str(epoch), "eval_results.txt")
+                result = {
+                    'train_loss': train_loss
+                }
+                if args.single_part:
+                    result['eval_ppl'] = eval_ppl
+                else:
+                    result['eval_accuracy'] = eval_accuracy
+
+                output_eval_file = os.path.join(epoch_root, "eval_results.txt")
                 with open(output_eval_file, "w") as writer:
                     logger.info("***** Eval results *****")
                     for key in sorted(result.keys()):
