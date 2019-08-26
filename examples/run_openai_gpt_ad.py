@@ -74,10 +74,7 @@ def tokenize_and_encode_single_part(dataset):
     special_tokens = ['<BOA>', '<EOA>']
     tokenizer = OpenAIGPTTokenizer.from_pretrained(model_name, special_tokens=special_tokens)
     for i in range(len(dataset)):
-        dataset[i] = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][0])),
-                      tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][1])),
-                      tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i][2]))]
-
+        dataset[i] = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(dataset[i]))
     return dataset
 
 

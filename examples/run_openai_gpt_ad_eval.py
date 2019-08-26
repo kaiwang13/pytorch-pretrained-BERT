@@ -115,7 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_schedule', type=str, default='warmup_linear')
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--n_valid', type=int, default=374)
-
+    parser.add_argument('--max_input_length', type=int, default=64)
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
     args = parser.parse_args()
@@ -153,6 +153,7 @@ if __name__ == '__main__':
     special_tokens_ids = list(tokenizer.convert_tokens_to_ids(token) for token in special_tokens)
 
     eval_dataset = json_load(args.eval_dataset)
+    eval_dataset = [[x[0], x[1], x[2]] for x in eval_dataset]
 
     tasks = chunk(eval_dataset, 20)
     with multiprocessing.Pool(processes=20) as pool:
@@ -161,9 +162,7 @@ if __name__ == '__main__':
     encoded_datasets = [eval_dataset]
 
     # Compute the max input length for the Transformer
-    input_length = max(len(title1) + len(title2) + len(description) + 4 \
-                       for dataset in encoded_datasets for title1, title2, description in dataset)
-    input_length = min(input_length, 64)  # Max size of input for the pre-trained model
+    input_length = args.max_input_length  # Max size of input for the pre-trained model
 
     # Prepare inputs tensors and dataloaders
     tensor_datasets = pre_process_datasets(encoded_datasets, input_length, *special_tokens_ids)
@@ -173,33 +172,24 @@ if __name__ == '__main__':
     eval_sampler = SequentialSampler(eval_data)
     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
+    token_log_freq = json_load('../samples/LM/token_log_freq.json')
+
     for epoch in range(2):
         epoch_root = os.path.join(args.output_dir, 'epoch' + str(epoch))
         model = OpenAIGPTLMHeadModel.from_pretrained(epoch_root)
+        model.load_token_log_freq(token_log_freq)
         tokenizer = OpenAIGPTTokenizer.from_pretrained(epoch_root)
         model.to(device)
         eval_loss, eval_accuracy = 0, 0
         nb_eval_steps, nb_eval_examples = 0, 0
+        results = json_load(args.eval_dataset)
+        index = 0
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_lengths, lm_labels = batch
             with torch.no_grad():
-                ppls = model.forward_ppl(input_ids, input_lengths)
-            ppls = ppls.reshape(-1, 4).numpy()
-            tmp_eval_accuracy = accuracy(ppls)
-
-            eval_accuracy += tmp_eval_accuracy
-
-            nb_eval_examples += input_ids.size(0)
-            nb_eval_steps += 1
-
-        eval_loss = eval_loss / nb_eval_steps
-        eval_accuracy = eval_accuracy / nb_eval_examples
-        result = {'eval_accuracy': eval_accuracy}
-
-        output_eval_file = os.path.join(epoch_root, "eval_results_ppl.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results *****")
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+                ppls = model.forward_normalized_ppl(input_ids, input_lengths).numpy()
+            for ppl in ppls:
+                results[index].append(ppl.item())
+                index += 1
+        json_dump(results, os.path.join(args.output_dir, 'epoch' + str(epoch), 'eval_result_label_normalized_ppl.json'))

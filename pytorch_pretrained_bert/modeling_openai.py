@@ -824,6 +824,7 @@ class OpenAIGPTLMHeadModel(OpenAIGPTPreTrainedModel):
         self.transformer = OpenAIGPTModel(config, output_attentions=output_attentions,
                                              keep_multihead_output=keep_multihead_output)
         self.lm_head = OpenAIGPTLMHead(self.transformer.tokens_embed.weight, config)
+        self.token_log_freq = None
         self.apply(self.init_weights)
 
     def set_num_special_tokens(self, num_special_tokens, predict_special_tokens=True):
@@ -882,6 +883,31 @@ class OpenAIGPTLMHeadModel(OpenAIGPTPreTrainedModel):
         for i in range(input_ids.size()[0]):
             for j in range(input_lengths[i] - 1):
                 result[i] -= log_probability[i][j][next_ids[i][j]]
+            result[i] /= input_lengths[i] - 1
+        return result
+
+    def load_token_log_freq(self, token_log_freq):
+        self.token_log_freq = token_log_freq
+
+    def forward_normalized_ppl(self, input_ids, input_lengths, position_ids=None, token_type_ids=None, head_mask=None):
+        hidden_states = self.transformer(input_ids, position_ids, token_type_ids, head_mask)
+        if self.transformer.output_attentions:
+            all_attentions, hidden_states = hidden_states
+        hidden_states = hidden_states[-1]
+
+        lm_logits = self.lm_head(hidden_states)
+        log_probability = torch.log_softmax(lm_logits, dim=-1)
+        next_ids = input_ids[..., 1:]
+        result = torch.zeros((input_ids.size()[0],))
+        for i in range(input_ids.size()[0]):
+            for j in range(input_lengths[i] - 1):
+                result[i] -= log_probability[i][j][next_ids[i][j]]
+                token_id = str(next_ids[i][j].item())
+                if token_id not in self.token_log_freq:
+                    log_freq = -math.log(140266081)
+                else:
+                    log_freq = self.token_log_freq[str(next_ids[i][j].item())]
+                result[i] -= log_freq
             result[i] /= input_lengths[i] - 1
         return result
 
